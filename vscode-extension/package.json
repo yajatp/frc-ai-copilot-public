@@ -1,0 +1,81 @@
+{
+  "name": "frc-ai-copilot",
+  "displayName": "FRC AI Copilot",
+  "description": "Builds and registers the FRC AI Copilot MCP server (stdio JSON-RPC) so Claude Code / Copilot can drive robot log analysis, CAN health, power analysis and PathPlanner tools.",
+  "version": "0.0.1",
+  "publisher": "mercsmavs",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:frcCopilot.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "frcCopilot.buildServer",
+        "title": "FRC AI Copilot: Build MCP Server",
+        "category": "FRC AI Copilot"
+      },
+      {
+        "command": "frcCopilot.showConfig",
+        "title": "FRC AI Copilot: Show .mcp.json Config",
+        "category": "FRC AI Copilot"
+      },
+      {
+        "command": "frcCopilot.locateJdk",
+        "title": "FRC AI Copilot: Locate WPILib JDK",
+        "category": "FRC AI Copilot"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "frc-copilot-container",
+          "title": "FRC Copilot",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "frc-copilot-container": [
+        {
+          "type": "webview",
+          "id": "frcCopilot.chatView",
+          "name": "Gemini Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "FRC AI Copilot",
+      "properties": {
+        "frcCopilot.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API Key for Google AI Studio (Gemini) to power the Copilot chat."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "@google/generative-ai": "^0.21.0",
+    "marked": "^15.0.0"
+  }
+}

@@ -1,0 +1,77 @@
+// Module 6 — Agentic closed-loop harness (sim/replay orchestration + assertions).
+apply plugin: 'application'
+
+dependencies {
+    implementation project(':core-ingest')
+    implementation project(':analysis')
+    implementation "edu.wpi.first.wpiutil:wpiutil-java:${wpilibVersion}" // DataLogWriter for demo logs
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+    implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.17.2'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Test logs write a real struct:Pose2d entry, because pose-shaped signals are where scenario
+    // generation and baseline divergence used to go blind. Needs WPILib's own struct serializer.
+    testImplementation "edu.wpi.first.wpimath:wpimath-java:${wpilibVersion}"
+    testImplementation "edu.wpi.first.wpiunits:wpiunits-java:${wpilibVersion}"
+    testRuntimeOnly 'us.hebi.quickbuf:quickbuf-runtime:1.4'
+}
+
+application {
+    mainClass = 'org.mercsmavs.frccopilot.simreplay.LoopCli'
+}
+
+// Natives only needed for the demo log generator (DataLogWriter). Reading/checking is pure Java.
+configurations {
+    natives
+}
+
+dependencies {
+    natives "edu.wpi.first.wpiutil:wpiutil-cpp:${wpilibVersion}:${rootProject.wpiNativeClassifier}@zip"
+}
+
+def nativesDir = layout.buildDirectory.dir('natives')
+
+def extractNatives = tasks.register('extractNatives', Copy) {
+    from { configurations.natives.collect { zipTree(it) } }
+    include rootProject.wpiNativePattern
+    eachFile { it.path = it.name }
+    includeEmptyDirs = false
+    into nativesDir
+}
+
+tasks.named('run') {
+    dependsOn extractNatives
+    systemProperty 'java.library.path', nativesDir.get().asFile.absolutePath
+}
+
+// Tests write real .wpilog files with DataLogWriter and read them back, so the loop is exercised
+// against WPILib's actual binary format rather than a hand-rolled stand-in.
+tasks.withType(Test).configureEach {
+    dependsOn extractNatives
+    systemProperty 'java.library.path', nativesDir.get().asFile.absolutePath
+}
+
+distributions {
+    main {
+        contents {
+            from(nativesDir) { into 'natives' }
+        }
+    }
+}
+
+['installDist', 'distTar', 'distZip'].each { t -> tasks.named(t) { dependsOn extractNatives } }
+
+tasks.named('startScripts') {
+    dependsOn extractNatives
+    doLast {
+        unixScript.text = unixScript.text.replace(
+                'exec "$JAVACMD" "$@"',
+                'exec "$JAVACMD" "-Djava.library.path=$APP_HOME/natives" "$@"')
+        windowsScript.text = windowsScript.text.replace(
+                '"%JAVA_EXE%" %DEFAULT_JVM_OPTS%',
+                '"%JAVA_EXE%" "-Djava.library.path=%APP_HOME%\\natives" %DEFAULT_JVM_OPTS%')
+    }
+}
+
+

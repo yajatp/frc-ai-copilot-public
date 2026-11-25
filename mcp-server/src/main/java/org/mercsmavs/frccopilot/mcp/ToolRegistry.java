@@ -1,0 +1,1296 @@
+package org.mercsmavs.frccopilot.mcp;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import org.mercsmavs.frccopilot.analysis.AnomalyDetection;
+import org.mercsmavs.frccopilot.analysis.BatteryHealth;
+import org.mercsmavs.frccopilot.analysis.CanHealth;
+import org.mercsmavs.frccopilot.analysis.Compare;
+import org.mercsmavs.frccopilot.analysis.Correlation;
+import org.mercsmavs.frccopilot.analysis.CycleTime;
+import org.mercsmavs.frccopilot.analysis.DataQuality;
+import org.mercsmavs.frccopilot.analysis.LoopTiming;
+import org.mercsmavs.frccopilot.analysis.PeakFinder;
+import org.mercsmavs.frccopilot.analysis.PowerAnalysis;
+import org.mercsmavs.frccopilot.analysis.RateOfChange;
+import org.mercsmavs.frccopilot.analysis.Series;
+import org.mercsmavs.frccopilot.analysis.SignalResolver;
+import org.mercsmavs.frccopilot.analysis.Statistics;
+import org.mercsmavs.frccopilot.analysis.SwerveAnalysis;
+import org.mercsmavs.frccopilot.analysis.VisionAnalysis;
+import org.mercsmavs.frccopilot.ingest.LogEntry;
+import org.mercsmavs.frccopilot.ingest.WpilogReader;
+import edu.wpi.first.networktables.NetworkTableInstance;
+import org.mercsmavs.frccopilot.knowledge.KnowledgeIndex;
+import org.mercsmavs.frccopilot.knowledge.SearchHit;
+import org.mercsmavs.frccopilot.ingest.store.LogSummary;
+import org.mercsmavs.frccopilot.ingest.store.TrendStore;
+import org.mercsmavs.frccopilot.livent.NtClient;
+import org.mercsmavs.frccopilot.modes.LogWatcher;
+import org.mercsmavs.frccopilot.modes.ModeA;
+import org.mercsmavs.frccopilot.modes.ModeAPass;
+import org.mercsmavs.frccopilot.profile.ProfileBuilder;
+import org.mercsmavs.frccopilot.profile.ProfileMapper;
+import org.mercsmavs.frccopilot.profile.RobotProfile;
+import org.mercsmavs.frccopilot.simreplay.LogDiff;
+import org.mercsmavs.frccopilot.simreplay.LoopConfig;
+import org.mercsmavs.frccopilot.simreplay.LoopRunner;
+import org.mercsmavs.frccopilot.simreplay.LoopSession;
+import org.mercsmavs.frccopilot.simreplay.RegressionSuite;
+import org.mercsmavs.frccopilot.simreplay.ScenarioGenerator;
+import org.mercsmavs.frccopilot.simreplay.Scenario;
+import org.mercsmavs.frccopilot.simreplay.Verifier;
+import org.mercsmavs.frccopilot.smallmodel.Dataset;
+import org.mercsmavs.frccopilot.smallmodel.LogFeatures;
+import org.mercsmavs.frccopilot.smallmodel.LogisticModel;
+import org.mercsmavs.frccopilot.smallmodel.SavedModel;
+import org.mercsmavs.frccopilot.write.AutoFile;
+import org.mercsmavs.frccopilot.write.PathDiff;
+import org.mercsmavs.frccopilot.write.PathFile;
+
+/** Builds the set of MCP tools exposed by the server, wired to Modules 1–4. */
+final class ToolRegistry {
+
+    private record SimpleTool(String name, String description, ObjectNode inputSchema, Handler handler)
+            implements Tool {
+        @Override
+        public String call(JsonNode arguments) throws Exception {
+            return handler.call(arguments == null ? com.fasterxml.jackson.databind.node.NullNode.getInstance() : arguments);
+        }
+    }
+
+    @FunctionalInterface
+    private interface Handler {
+        String call(JsonNode args) throws Exception;
+    }
+
+    static Map<String, Tool> build() {
+        Map<String, Tool> tools = new LinkedHashMap<>();
+        add(tools, new SimpleTool("get_guide", "Read this FIRST. Describes the server, its epistemic"
+                + " guardrails, and the intended workflow (load a robot profile, then analyze).",
+                Schemas.empty(), ToolRegistry::guide));
+
+        add(tools, new SimpleTool("log_info", "Summary of a .wpilog: version, entry count, duration.",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog file", true)),
+                ToolRegistry::logInfo));
+
+        add(tools, new SimpleTool("log_entries", "List entries (signals) in a .wpilog, optionally"
+                + " filtered by a name substring.",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog file", true),
+                        new Schemas.Prop("filter", "string", "Case-insensitive name substring", false)),
+                ToolRegistry::logEntries));
+
+        add(tools, new SimpleTool("read_entry", "Read decoded samples for one entry (capped).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog file", true),
+                        new Schemas.Prop("entry", "string", "Exact entry name", true),
+                        new Schemas.Prop("limit", "integer", "Max samples to return (default 200)", false)),
+                ToolRegistry::readEntry));
+
+        add(tools, new SimpleTool("ingest_log", "Parse a .wpilog and persist its summary + entry"
+                + " index into a SQLite trend store (so season queries don't re-parse).",
+                Schemas.object(
+                        new Schemas.Prop("db", "string", "Path to the SQLite store", true),
+                        new Schemas.Prop("file", "string", "Path to a .wpilog file", true)),
+                ToolRegistry::ingestLog));
+
+        add(tools, new SimpleTool("power_analysis", "Brownout/battery analysis over a log's voltage"
+                + " signal. Hedged, quality-scored. (The 2026 energy-management meta.)",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog file", true)),
+                ToolRegistry::powerAnalysis));
+
+        add(tools, new SimpleTool("can_health", "CAN error-count analysis over a log. Hedged.",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog file", true)),
+                ToolRegistry::canHealth));
+
+        add(tools, new SimpleTool("profile_show", "Show a robot profile (YAML) so analysis is"
+                + " robot-specific (CAN map, drivetrain, subsystems).",
+                Schemas.object(new Schemas.Prop("profile", "string", "Path to a profile .yaml", true)),
+                ToolRegistry::profileShow));
+
+        add(tools, new SimpleTool("profile_init", "START HERE for a team that has not used this tool"
+                + " before. Scans a WPILib robot repository and generates the robot profile every"
+                + " other tool reads — CAN IDs, drivetrain geometry, PathPlanner settings, vendordeps"
+                + " — so analysis is specific to THIS robot instead of generic. Writes the profile"
+                + " only when 'out' is given; otherwise it is a dry run you can review first. Always"
+                + " surface the warnings it returns: CAN IDs the code marked TODO/NOT ACCURATE are"
+                + " guesses, and acting on a wrong CAN ID sends a human to check the wrong motor.",
+                Schemas.object(
+                        new Schemas.Prop("repo", "string",
+                                "Path to the team's WPILib robot repository (the directory with"
+                                        + " src/main/java and, usually, src/main/deploy/pathplanner)", true),
+                        new Schemas.Prop("out", "string",
+                                "Where to write the profile .yaml (omit for a dry run)", false),
+                        new Schemas.Prop("team", "integer", "FRC team number, if not discoverable", false),
+                        new Schemas.Prop("robot", "string", "Robot name, e.g. 'echo'", false),
+                        new Schemas.Prop("game", "string",
+                                "Season game key; defaults to the current season", false)),
+                ToolRegistry::profileInit));
+
+        add(tools, new SimpleTool("pathplanner_show", "Summarize a PathPlanner .path (waypoints,"
+                + " constraints).",
+                Schemas.object(new Schemas.Prop("path", "string", "Path to a .path file", true)),
+                ToolRegistry::pathShow));
+
+        add(tools, new SimpleTool("pathplanner_fudge", "Propose translating a waypoint by (dx,dy)"
+                + " meters. Returns a reviewable diff; writes only if 'out' is given.",
+                Schemas.object(
+                        new Schemas.Prop("path", "string", "Path to a .path file", true),
+                        new Schemas.Prop("index", "integer", "Waypoint index (0-based)", true),
+                        new Schemas.Prop("dx", "number", "Shift in +x meters", true),
+                        new Schemas.Prop("dy", "number", "Shift in +y meters", true),
+                        new Schemas.Prop("out", "string", "Output path (omit for dry-run)", false)),
+                ToolRegistry::pathFudge));
+
+        add(tools, new SimpleTool("pathplanner_set_speed", "Propose new global max velocity/accel"
+                + " for a path. Reviewable diff; writes only if 'out' is given.",
+                Schemas.object(
+                        new Schemas.Prop("path", "string", "Path to a .path file", true),
+                        new Schemas.Prop("maxVelocity", "number", "New max velocity (m/s)", true),
+                        new Schemas.Prop("maxAcceleration", "number", "New max acceleration (m/s^2)", true),
+                        new Schemas.Prop("out", "string", "Output path (omit for dry-run)", false)),
+                ToolRegistry::pathSetSpeed));
+
+        add(tools, new SimpleTool("pathplanner_move_marker", "Retime an event marker — the 'timing'"
+                + " half of a between-match autonomous tweak (e.g. spin the flywheels up earlier)."
+                + " Positions are waypoint-relative, NOT seconds: the integer part is a waypoint"
+                + " index and the fraction is progress along the next segment, so a path with N"
+                + " waypoints spans 0..N-1. Call pathplanner_show first to see the markers and their"
+                + " current positions. A ranged marker keeps its length when moved, unless you pass"
+                + " endPos. Reviewable diff; writes only if 'out' is given.",
+                Schemas.object(
+                        new Schemas.Prop("path", "string", "Path to a .path file", true),
+                        new Schemas.Prop("index", "integer", "Event-marker index (0-based)", true),
+                        new Schemas.Prop("delta", "number",
+                                "Retime by this much, relative to the marker's current position"
+                                        + " (negative = earlier). Use instead of 'pos'.", false),
+                        new Schemas.Prop("pos", "number", "New absolute waypoint-relative position", false),
+                        new Schemas.Prop("endPos", "number",
+                                "New end position for a ranged marker; null converts it to a point"
+                                        + " marker. Omit to preserve the existing length.", false),
+                        new Schemas.Prop("out", "string", "Output path (omit for dry-run)", false)),
+                ToolRegistry::pathMoveMarker));
+
+        add(tools, new SimpleTool("pathplanner_set_zone", "Move a constraint zone, or change a"
+                + " constraint inside it (e.g. maxVelocity, to slow the robot through one tight"
+                + " passage without slowing the whole path — which is what pathplanner_set_speed"
+                + " does). Bounds are waypoint-relative, not seconds. Reviewable diff; writes only"
+                + " if 'out' is given.",
+                Schemas.object(
+                        new Schemas.Prop("path", "string", "Path to a .path file", true),
+                        new Schemas.Prop("index", "integer", "Constraint-zone index (0-based)", true),
+                        new Schemas.Prop("minPos", "number", "New zone start (with maxPos)", false),
+                        new Schemas.Prop("maxPos", "number", "New zone end (with minPos)", false),
+                        new Schemas.Prop("key", "string",
+                                "Constraint to change inside the zone, e.g. maxVelocity,"
+                                        + " maxAcceleration, maxAngularVelocity (with value)", false),
+                        new Schemas.Prop("value", "number", "New value for 'key'", false),
+                        new Schemas.Prop("out", "string", "Output path (omit for dry-run)", false)),
+                ToolRegistry::pathSetZone));
+
+        add(tools, new SimpleTool("loop_check", "Verify a scenario's success criteria against a"
+                + " log (the closed-loop 'verify' step). Returns per-check PASS/FAIL.",
+                Schemas.object(
+                        new Schemas.Prop("log", "string", "Path to a .wpilog (sim/replay/real)", true),
+                        new Schemas.Prop("scenario", "string", "Path to a scenario .yaml", true)),
+                ToolRegistry::loopCheck));
+
+        add(tools, new SimpleTool("loop_suite", "Run a whole regression suite (a directory of"
+                + " scenarios) against a log — every banked fix re-checked at once.",
+                Schemas.object(
+                        new Schemas.Prop("log", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("scenarioDir", "string", "Directory of scenario .yaml files", true)),
+                ToolRegistry::loopSuite));
+
+        add(tools, new SimpleTool("loop_iterate", "Run ONE full turn of the agentic closed loop:"
+                + " rebuild the robot code, run it headless, verify every scenario against the log it"
+                + " produced, and diagnose what failed. Use this after editing robot code — it reports"
+                + " build errors, missing logs, and misbehaviour as distinct outcomes, and says which"
+                + " checked values moved since your last edit. Requires a loop.yaml in the project.",
+                Schemas.object(
+                        new Schemas.Prop("config", "string",
+                                "Path to loop.yaml or a directory inside the project (default: cwd)", false),
+                        new Schemas.Prop("scenario", "string",
+                                "Check a single scenario .yaml instead of the whole suite", false),
+                        new Schemas.Prop("inputLog", "string",
+                                "For a REPLAY config (its run command uses {inputLog}): the recorded"
+                                        + " .wpilog to replay this turn, instead of the one the config"
+                                        + " names. This answers 'what would my change have done on"
+                                        + " THIS match' without resimulating. Ignored by sim configs.",
+                                false)),
+                ToolRegistry::loopIterate));
+
+        add(tools, new SimpleTool("loop_bootstrap", "Build and run the robot project ONCE without"
+                + " verifying anything, to produce a first log. Use this when loop_iterate reports"
+                + " NO_SCENARIOS: a scenario is derived from a known-good log, so a project that has"
+                + " never produced one has nothing to derive from. Follow with loop_generate on the"
+                + " log this returns, read the thresholds, then loop_iterate.",
+                Schemas.object(
+                        new Schemas.Prop("config", "string",
+                                "Path to loop.yaml or a directory inside the project (default: cwd)", false),
+                        new Schemas.Prop("inputLog", "string",
+                                "For a REPLAY config: the recorded .wpilog to replay", false)),
+                ToolRegistry::loopBootstrap));
+
+        add(tools, new SimpleTool("loop_baseline", "Adopt the most recent PASSING iteration's log as"
+                + " this project's baseline. Do this after loop_iterate passes: with a baseline"
+                + " adopted, later turns report which signals diverged from the known-good run, and"
+                + " can distinguish a sign error (POLARITY_REVERSED) from a mechanism that merely"
+                + " underperformed. Without one, both look like a shortfall.",
+                Schemas.object(
+                        new Schemas.Prop("config", "string",
+                                "Path to loop.yaml or a directory inside the project (default: cwd)", false)),
+                ToolRegistry::loopBaseline));
+
+        add(tools, new SimpleTool("smallmodel_train", "Train a tiny logistic classifier from a few"
+                + " moments YOU mark in a log — the 'big AI trains a small AI' technique. The use case"
+                + " is a judgement call with no sensor for it (e.g. the right moment to stage game"
+                + " pieces): mark ~30 good moments, learn a predictor over chosen signals, save it as"
+                + " readable JSON that can be checked into the robot repo. Timestamps are SECONDS of"
+                + " log time. Metrics returned are TRAINING-set metrics — they show the model fit your"
+                + " marks, not that it generalizes; validate with smallmodel_score on a different log.",
+                Schemas.object(
+                        new Schemas.Prop("log", "string", "Path to the .wpilog to learn from", true),
+                        new Schemas.Prop("out", "string", "Where to write the model JSON", true),
+                        new Schemas.Prop("signals", "array",
+                                "Feature signal names, exactly as they appear in the log"
+                                        + " (use log_entries to find them)", true, "string"),
+                        new Schemas.Prop("positives", "array",
+                                "Timestamps (seconds) you are marking as the positive class", true, "number"),
+                        new Schemas.Prop("negatives", "array",
+                                "Explicit negative timestamps (seconds). Omit to draw negatives from"
+                                        + " the rest of the log.", false, "number"),
+                        new Schemas.Prop("stride", "integer",
+                                "When drawing negatives, take every Nth sample (default 10)", false),
+                        new Schemas.Prop("threshold", "number",
+                                "Decision threshold (default 0.5; raise it to cut false positives)", false),
+                        new Schemas.Prop("epochs", "integer", "Training epochs (default 3000)", false),
+                        new Schemas.Prop("learningRate", "number", "Learning rate (default 0.1)", false)),
+                ToolRegistry::smallmodelTrain));
+
+        add(tools, new SimpleTool("smallmodel_score", "Run a saved small model over a log and report"
+                + " where it fires, highest-scoring moments first. This is how you validate a model"
+                + " against a log it was not trained on before trusting it on the robot.",
+                Schemas.object(
+                        new Schemas.Prop("model", "string", "Path to a model JSON from smallmodel_train", true),
+                        new Schemas.Prop("log", "string", "Path to the .wpilog to score", true),
+                        new Schemas.Prop("top", "integer", "How many top moments to list (default 10)", false)),
+                ToolRegistry::smallmodelScore));
+
+        add(tools, new SimpleTool("loop_history", "The iteration journal for a project: every"
+                + " previous turn, which source files changed, and how each checked value moved."
+                + " Read this when resuming work to see what has already been tried.",
+                Schemas.object(
+                        new Schemas.Prop("config", "string",
+                                "Path to loop.yaml or a directory inside the project (default: cwd)", false)),
+                ToolRegistry::loopHistory));
+
+        add(tools, new SimpleTool("loop_generate", "Derive a regression scenario from a run that is"
+                + " known to be good, so a verified fix can be banked as a standing check. Proposes"
+                + " thresholds for counters, battery voltage, loop period, and converging errors."
+                + " Dry-run unless 'out' is given. Review the thresholds — they encode one run.",
+                Schemas.object(
+                        new Schemas.Prop("log", "string", "Path to a known-good .wpilog", true),
+                        new Schemas.Prop("out", "string", "Where to write the scenario (omit for dry-run)", false),
+                        new Schemas.Prop("name", "string", "Scenario name", false),
+                        new Schemas.Prop("phaseSignal", "string",
+                                "Scope every check to a phase, e.g. /Robot/State", false),
+                        new Schemas.Prop("phaseEquals", "string", "The phase value, e.g. AUTO", false)),
+                ToolRegistry::loopGenerate));
+
+        add(tools, new SimpleTool("loop_diff", "Rank how far a run diverged from a known-good"
+                + " baseline log, signal by signal. The largest divergence usually sits closest to the"
+                + " cause; signals present in only one log point at a rename or a subsystem that"
+                + " never initialized.",
+                Schemas.object(
+                        new Schemas.Prop("baseline", "string", "Path to the known-good .wpilog", true),
+                        new Schemas.Prop("log", "string", "Path to the run being investigated", true)),
+                ToolRegistry::loopDiff));
+
+        add(tools, new SimpleTool("mode_a", "Mode A between-match pass: ingest a log, flag"
+                + " brownout/battery/CAN/loop issues, and persist metrics to the trend store.",
+                Schemas.object(
+                        new Schemas.Prop("db", "string", "Path to the SQLite trend store", true),
+                        new Schemas.Prop("file", "string", "Path to the match .wpilog", true)),
+                ToolRegistry::modeA));
+
+        add(tools, new SimpleTool("mode_a_scan", "Sweep one or more directories (USB mount point,"
+                + " Driver Station log folder) for .wpilog files not yet in the trend store, and run"
+                + " the Mode A pass on each. Use this to catch up after matches happened without the"
+                + " watcher running; for continuous ingest between matches, run the daemon"
+                + " (`modes watch <db> <dir>...`) instead, which cannot be a tool because it blocks.",
+                Schemas.object(
+                        new Schemas.Prop("db", "string", "Path to the SQLite trend store", true),
+                        new Schemas.Prop("dirs", "array", "Directories to scan (recursively, 4 levels)",
+                                true, "string")),
+                ToolRegistry::modeAScan));
+
+        add(tools, new SimpleTool("swerve_analysis", "Detect underdamped/oscillating closed-loop"
+                + " behavior from a swerve module signal (hedged PID guidance).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name (optional; auto-resolved if omitted)", false)),
+                ToolRegistry::swerve));
+
+        add(tools, new SimpleTool("vision_analysis", "Vision detection rate / dropouts from a"
+                + " hasTarget or tag-count signal.",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog", true)),
+                ToolRegistry::vision));
+
+        add(tools, new SimpleTool("loop_timing", "Loop overrun analysis (vs 20 ms) from a"
+                + " loop-period signal.",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog", true)),
+                ToolRegistry::loopTiming));
+
+        add(tools, new SimpleTool("battery_health", "Battery droop / internal-resistance indicator"
+                + " with a hedged end-of-match sag projection.",
+                Schemas.object(new Schemas.Prop("file", "string", "Path to a .wpilog", true)),
+                ToolRegistry::batteryHealth));
+
+        add(tools, new SimpleTool("anomaly", "Robust (MAD) outlier detection on one signal.",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name", true)),
+                ToolRegistry::anomaly));
+
+        add(tools, new SimpleTool("analyze_cycles", "Scoring cycle-time analysis from a monotonic"
+                + " cycle/score counter: how many cycles, and how fast (mean/median/fastest).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Counter signal name (optional; auto-resolved if omitted)", false)),
+                ToolRegistry::analyzeCycles));
+
+        add(tools, new SimpleTool("signal_stats", "Summary statistics for one signal"
+                + " (min/max/mean/median/stdDev/p95) with a data-quality block.",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name", true)),
+                ToolRegistry::signalStats));
+
+        add(tools, new SimpleTool("compare_signals", "Compare summary statistics of two signals —"
+                + " the same signal across two matches, or two symmetric mechanisms (left vs right).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "First signal name", true),
+                        new Schemas.Prop("entryB", "string", "Second signal name (defaults to 'entry')", false),
+                        new Schemas.Prop("fileB", "string", "Second .wpilog (defaults to 'file')", false)),
+                ToolRegistry::compareSignals));
+
+        add(tools, new SimpleTool("correlate", "Pearson correlation between two signals"
+                + " (nearest-timestamp aligned). Suggests a relationship; never proves causation.",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "First signal name", true),
+                        new Schemas.Prop("entryB", "string", "Second signal name", true),
+                        new Schemas.Prop("fileB", "string", "Second .wpilog (defaults to 'file')", false)),
+                ToolRegistry::correlate));
+
+        add(tools, new SimpleTool("find_peaks", "Find local maxima in a signal whose prominence"
+                + " exceeds a threshold (current spikes, impact events).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name", true),
+                        new Schemas.Prop("minProminence", "number", "Minimum peak prominence (default 1.0)", false)),
+                ToolRegistry::findPeaks));
+
+        add(tools, new SimpleTool("rate_of_change", "Derivative statistics for a signal (units per"
+                + " second) — max/min slope and when the steepest change happened.",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name", true)),
+                ToolRegistry::rateOfChange));
+
+        add(tools, new SimpleTool("data_quality", "Assess how much a signal's sampling actually"
+                + " supports a conclusion (sample count, span, period regularity, confidence).",
+                Schemas.object(
+                        new Schemas.Prop("file", "string", "Path to a .wpilog", true),
+                        new Schemas.Prop("entry", "string", "Signal name", true)),
+                ToolRegistry::dataQuality));
+
+        add(tools, new SimpleTool("search_docs", "Search the offline documentation index (WPILib,"
+                + " CTRE Phoenix 6, PhotonVision, PathPlanner) with a natural-language question."
+                + " Use this before answering any API question from memory — the docs are"
+                + " versioned and your recollection of them is not.",
+                Schemas.object(
+                        new Schemas.Prop("query", "string", "A natural-language question or API name", true),
+                        new Schemas.Prop("source", "string", "Restrict to one corpus: wpilib | ctre | photonvision | pathplanner", false),
+                        new Schemas.Prop("limit", "integer", "Max results (default 6)", false),
+                        new Schemas.Prop("db", "string", "Index path (default .knowledge/frc.kdb)", false)),
+                ToolRegistry::searchDocs));
+
+        add(tools, new SimpleTool("search_manual", "Search the indexed game manual PDF for a rule."
+                + " Returns the passage and its page number so the rule can be verified. Never"
+                + " state a rule from memory — cite the page.",
+                Schemas.object(
+                        new Schemas.Prop("query", "string", "Rule code (e.g. G410) or a question", true),
+                        new Schemas.Prop("limit", "integer", "Max results (default 6)", false),
+                        new Schemas.Prop("db", "string", "Index path (default .knowledge/frc.kdb)", false)),
+                ToolRegistry::searchManual));
+
+        add(tools, new SimpleTool("knowledge_status", "Show which documentation corpora are indexed"
+                + " and how large each is. Call this if a search returns nothing.",
+                Schemas.object(new Schemas.Prop("db", "string", "Index path (default .knowledge/frc.kdb)", false)),
+                ToolRegistry::knowledgeStatus));
+
+        add(tools, new SimpleTool("nt_status", "Connect to a live robot's NetworkTables server and"
+                + " report whether the connection is up (live/real-time; read-only).",
+                Schemas.object(
+                        new Schemas.Prop("host", "string", "Robot NT server host/IP (e.g. 10.TE.AM.2 or localhost)", true),
+                        new Schemas.Prop("port", "integer", "NT4 port (default 5810)", false)),
+                ToolRegistry::ntStatus));
+
+        add(tools, new SimpleTool("nt_get", "Read a single live value from NetworkTables by key"
+                + " (read-only; the copilot never writes actuator/enable values).",
+                Schemas.object(
+                        new Schemas.Prop("host", "string", "Robot NT server host/IP", true),
+                        new Schemas.Prop("key", "string", "Topic key, e.g. /SmartDashboard/x", true),
+                        new Schemas.Prop("port", "integer", "NT4 port (default 5810)", false)),
+                ToolRegistry::ntGet));
+
+        add(tools, new SimpleTool("nt_keys", "List live NetworkTables keys (optionally by prefix).",
+                Schemas.object(
+                        new Schemas.Prop("host", "string", "Robot NT server host/IP", true),
+                        new Schemas.Prop("prefix", "string", "Key prefix filter (optional)", false),
+                        new Schemas.Prop("port", "integer", "NT4 port (default 5810)", false)),
+                ToolRegistry::ntKeys));
+
+        add(tools, new SimpleTool("auto_show", "Summarize a PathPlanner .auto (path references).",
+                Schemas.object(new Schemas.Prop("auto", "string", "Path to a .auto file", true)),
+                ToolRegistry::autoShow));
+
+        add(tools, new SimpleTool("auto_swap_path", "Propose swapping a path reference in a .auto."
+                + " Reviewable diff; writes only if 'out' is given.",
+                Schemas.object(
+                        new Schemas.Prop("auto", "string", "Path to a .auto file", true),
+                        new Schemas.Prop("oldName", "string", "Existing path name", true),
+                        new Schemas.Prop("newName", "string", "Replacement path name", true),
+                        new Schemas.Prop("out", "string", "Output path (omit for dry-run)", false)),
+                ToolRegistry::autoSwap));
+
+        return tools;
+    }
+
+    // --- handlers ---
+
+    private static String guide(JsonNode a) {
+        return """
+                FRC AI Copilot — MCP server (Modules 1–6 + Mode A + live NT + docs + small models; 44 tools).
+
+                Workflow:
+                  0) For any API or rules question, call search_docs / search_manual FIRST. The
+                     index holds the actual WPILib, CTRE Phoenix 6, PhotonVision and PathPlanner
+                     documentation, and the season game manual with page numbers. FRC APIs change
+                     every season and rules change every year — answering from memory is how you
+                     hand a team a method that no longer exists or a rule that was revised.
+                  1) Call profile_show on the team's robot profile so analysis is robot-specific
+                     (CAN map, drivetrain, current limit, subsystems). If the team has no profile
+                     yet, profile_init generates one from their robot repository — that is the
+                     first thing to do for a team new to this tool. Relay its warnings verbatim;
+                     an unverified CAN ID sends someone to the wrong motor.
+                  2) Use log_info / log_entries / read_entry to explore a match log.
+                  3) Use power_analysis, can_health, battery_health, and loop_timing for the Mode-A
+                     safety picture (brownouts, battery, CAN, loop overruns) — the 2026
+                     energy-management meta. mode_a runs this whole pass in one call and persists
+                     metrics to a trend store. mode_a_scan sweeps a USB drive or the Driver
+                     Station log folder for logs not yet ingested and runs that pass on each; for
+                     continuous between-match ingest, the pit laptop runs the daemon instead
+                     (`modes watch <db> <dir>...`), which cannot be a tool because it blocks.
+                  4) Use swerve_analysis, vision_analysis, and anomaly for deeper Mode-B diagnosis
+                     when there's time to chase a specific hypothesis. The general-purpose
+                     primitives compose for anything not covered by a named tool: signal_stats
+                     (summarize), rate_of_change (spikes/jerk), find_peaks (impact/current
+                     events), compare_signals (match-over-match or left-vs-right), correlate
+                     (does X move with Y?), data_quality (is this signal even worth trusting?),
+                     and analyze_cycles (scoring throughput from a cycle counter).
+                  5) Use pathplanner_show/fudge/set_speed/move_marker/set_zone and
+                     auto_show/auto_swap_path to propose autonomous adjustments (the only thing
+                     teams change at competition). Waypoints are the positional tweak;
+                     move_marker/set_zone are the timing ones. Marker and zone positions are
+                     waypoint-relative, NOT seconds — call pathplanner_show first.
+                  6) Use loop_check/loop_suite to verify a robot-code fix against a written
+                     success criterion (or a whole regression suite) before calling it done.
+                  7) Use loop_iterate to run a full build/run/verify turn after editing robot
+                     code. For a REPLAY config, pass inputLog to ask what a change would have done
+                     on a match that already happened, without resimulating.
+                     Onboarding a project with no scenarios yet: loop_bootstrap (produces the first
+                     log) -> loop_generate (proposes checks from it) -> loop_iterate. Once a turn
+                     passes, call loop_baseline — divergence reporting and the sign-error diagnosis
+                     both depend on having a known-good run adopted.
+                  8) Use nt_status/nt_get/nt_keys to read a live, running robot's NetworkTables
+                     (read-only — there is no NT write tool).
+                  9) smallmodel_train/smallmodel_score handle the judgement calls no sensor
+                     reports: mark ~30 moments in a log, learn a tiny inspectable classifier, then
+                     score it against a DIFFERENT log before trusting it. Its metrics are
+                     training-set metrics; treat them as fit, not generalization.
+
+                Epistemic guardrails: every analysis result carries a data-quality/confidence block
+                and hedged language. A single match is rarely conclusive — corroborate across matches.
+                Write tools are dry-run by default and never overwrite a file in place.
+                """;
+    }
+
+    private static String logInfo(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Map<Integer, LogEntry> index = r.index();
+        long samples = index.values().stream().mapToLong(LogEntry::count).sum();
+        double dur = index.values().stream().mapToDouble(LogEntry::spanSeconds).max().orElse(0);
+        return "version=" + r.version() + "\nentries=" + index.size() + "\nsamples=" + samples
+                + String.format("%nduration=%.2f s", dur);
+    }
+
+    private static String logEntries(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        String filter = a.hasNonNull("filter") ? a.get("filter").asText().toLowerCase() : null;
+        StringBuilder sb = new StringBuilder();
+        r.index().values().stream()
+                .filter(e -> filter == null || e.name.toLowerCase().contains(filter))
+                .sorted((x, y) -> x.name.compareToIgnoreCase(y.name))
+                .forEach(e -> sb.append(String.format("%-8d %-8s %s%n", e.count(), e.type, e.name)));
+        return sb.isEmpty() ? "(no matching entries)" : sb.toString();
+    }
+
+    private static String readEntry(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        int limit = a.hasNonNull("limit") ? a.get("limit").asInt() : 200;
+        List<WpilogReader.Sample> samples = r.read(str(a, "entry"));
+        if (samples.isEmpty()) {
+            return "(no samples for '" + str(a, "entry") + "')";
+        }
+        StringBuilder sb = new StringBuilder();
+        int n = Math.min(limit, samples.size());
+        for (int i = 0; i < n; i++) {
+            WpilogReader.Sample s = samples.get(i);
+            sb.append(String.format("%.4f\t%s%n", s.timestampSeconds(), render(s.value())));
+        }
+        if (samples.size() > n) {
+            sb.append("... (").append(samples.size() - n).append(" more of ").append(samples.size())
+                    .append(" total)\n");
+        }
+        return sb.toString();
+    }
+
+    private static String ingestLog(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Map<Integer, LogEntry> index = r.index();
+        LogSummary summary = LogSummary.from(r, index);
+        try (TrendStore store = new TrendStore(str(a, "db"))) {
+            long id = store.ingest(summary, index.values());
+            return "Ingested log #" + id + " (" + index.size() + " entries, "
+                    + String.format("%.2f s", summary.durationSeconds()) + ").";
+        }
+    }
+
+    private static String powerAnalysis(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Optional<String> sig = SignalResolver.resolve(r.index(), SignalResolver.VOLTAGE);
+        if (sig.isEmpty()) {
+            return "No battery-voltage signal found; cannot assess brownout risk.";
+        }
+        Series v = Series.fromSamples(r.read(sig.get()));
+        PowerAnalysis.Result res = PowerAnalysis.analyze(v);
+        StringBuilder sb = new StringBuilder("signal: " + sig.get() + "\n" + res.assessment() + "\n");
+        for (PowerAnalysis.BrownoutEvent e : res.events()) {
+            sb.append(String.format("  - %.2fs–%.2fs min %.2f V (%.0f ms)%n",
+                    e.startSeconds(), e.endSeconds(), e.minVolts(), e.durationMs()));
+        }
+        return sb.toString();
+    }
+
+    private static String canHealth(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Optional<String> sig = SignalResolver.resolve(r.index(), SignalResolver.CAN_ERRORS);
+        if (sig.isEmpty()) {
+            return "No CAN error-count signal found.";
+        }
+        Series c = Series.fromSamples(r.read(sig.get()));
+        return "signal: " + sig.get() + "\n" + CanHealth.analyze(c).assessment();
+    }
+
+    private static String profileShow(JsonNode a) throws Exception {
+        RobotProfile p = ProfileMapper.read(Path.of(str(a, "profile")));
+        return ProfileMapper.toYaml(p);
+    }
+
+    private static String profileInit(JsonNode a) throws Exception {
+        Path repo = Path.of(str(a, "repo"));
+        if (!java.nio.file.Files.isDirectory(repo)) {
+            return "Not a directory: " + repo + ". Point 'repo' at the robot project's root — the"
+                    + " directory containing src/main/java.";
+        }
+        ProfileBuilder.Result result = ProfileBuilder.fromRepo(
+                repo,
+                a.hasNonNull("team") ? a.get("team").asInt() : null,
+                optional(a, "robot", null),
+                optional(a, "game", org.mercsmavs.frccopilot.profile.GameData.defaultGame()));
+
+        StringBuilder sb = new StringBuilder();
+        String out = optional(a, "out", null);
+        if (out == null) {
+            sb.append("DRY RUN — nothing written. Pass 'out' to save this profile.\n\n");
+            sb.append(ProfileMapper.toYaml(result.profile()));
+        } else {
+            ProfileMapper.write(result.profile(), Path.of(out),
+                    "Generated by frc-ai-copilot from " + repo
+                            + "\nReview CAN IDs (especially any flagged accurate: false) before use.");
+            sb.append("Wrote profile: ").append(out).append('\n');
+        }
+
+        if (!result.warnings().isEmpty()) {
+            // These are the difference between a profile that is right and one that merely parses,
+            // so they lead rather than trail — a caller skimming the YAML would miss them otherwise.
+            sb.append("\nWARNINGS — review before trusting this profile:\n");
+            for (String w : result.warnings()) {
+                sb.append("  - ").append(w).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String pathShow(JsonNode a) throws Exception {
+        PathFile p = PathFile.load(Path.of(str(a, "path")));
+        StringBuilder sb = new StringBuilder("version=" + p.version() + " waypoints=" + p.waypointCount() + "\n");
+        for (int i = 0; i < p.waypointCount(); i++) {
+            double[] anchor = p.anchor(i);
+            sb.append(String.format("  [%d] (%.3f, %.3f)%n", i, anchor[0], anchor[1]));
+        }
+        sb.append("maxVel=").append(p.globalConstraint("maxVelocity"))
+                .append(" maxAccel=").append(p.globalConstraint("maxAcceleration")).append('\n');
+
+        // Positions are waypoint-relative, not seconds — say so, since an agent will otherwise
+        // reasonably assume a marker at 2.64 means 2.64 seconds.
+        sb.append("event markers (positions are waypoint-relative, range 0..")
+                .append(p.waypointCount() - 1).append("):\n");
+        for (int i = 0; i < p.eventMarkerCount(); i++) {
+            PathFile.EventMarker m = p.eventMarker(i);
+            sb.append(String.format("  [%d] %s at %.4f%s%n", i, m.name(), m.pos(),
+                    m.ranged() ? String.format(" .. %.4f", m.endPos()) : ""));
+        }
+        sb.append("constraint zones:\n");
+        for (int i = 0; i < p.constraintZoneCount(); i++) {
+            PathFile.ConstraintZone z = p.constraintZone(i);
+            sb.append(String.format("  [%d] %s %.4f..%.4f maxVel=%s maxAccel=%s%n",
+                    i, z.name(), z.minPos(), z.maxPos(),
+                    p.zoneConstraint(i, "maxVelocity"), p.zoneConstraint(i, "maxAcceleration")));
+        }
+        return sb.toString();
+    }
+
+    private static String pathMoveMarker(JsonNode a) throws Exception {
+        PathFile before = PathFile.load(Path.of(str(a, "path")));
+        PathFile after = before.copy();
+        int index = a.get("index").asInt();
+        if (a.hasNonNull("delta")) {
+            after.shiftEventMarker(index, a.get("delta").asDouble());
+        } else if (a.hasNonNull("pos")) {
+            // An explicit endPos changes the interval's length; without one, a ranged marker is
+            // translated with its length preserved.
+            if (a.has("endPos")) {
+                Double end = a.hasNonNull("endPos") ? a.get("endPos").asDouble() : null;
+                after.setEventMarkerRange(index, a.get("pos").asDouble(), end);
+            } else {
+                after.moveEventMarker(index, a.get("pos").asDouble());
+            }
+        } else {
+            return "Pass either 'delta' (retime relative to where the marker is now) or 'pos'.";
+        }
+        return applyOrDryRun(before, after, a.hasNonNull("out") ? a.get("out").asText() : null);
+    }
+
+    private static String pathSetZone(JsonNode a) throws Exception {
+        PathFile before = PathFile.load(Path.of(str(a, "path")));
+        PathFile after = before.copy();
+        int index = a.get("index").asInt();
+        boolean did = false;
+        if (a.hasNonNull("minPos") && a.hasNonNull("maxPos")) {
+            after.setConstraintZoneRange(index, a.get("minPos").asDouble(), a.get("maxPos").asDouble());
+            did = true;
+        }
+        if (a.hasNonNull("key") && a.hasNonNull("value")) {
+            after.setZoneConstraint(index, a.get("key").asText(), a.get("value").asDouble());
+            did = true;
+        }
+        if (!did) {
+            return "Pass 'minPos'+'maxPos' to move the zone, and/or 'key'+'value' to change a"
+                    + " constraint inside it (e.g. key=maxVelocity).";
+        }
+        return applyOrDryRun(before, after, a.hasNonNull("out") ? a.get("out").asText() : null);
+    }
+
+    private static String pathFudge(JsonNode a) throws Exception {
+        PathFile before = PathFile.load(Path.of(str(a, "path")));
+        PathFile after = before.copy();
+        after.translateWaypoint(a.get("index").asInt(), a.get("dx").asDouble(), a.get("dy").asDouble());
+        return applyOrDryRun(before, after, a.hasNonNull("out") ? a.get("out").asText() : null);
+    }
+
+    private static String pathSetSpeed(JsonNode a) throws Exception {
+        PathFile before = PathFile.load(Path.of(str(a, "path")));
+        PathFile after = before.copy();
+        after.setGlobalConstraint("maxVelocity", a.get("maxVelocity").asDouble());
+        after.setGlobalConstraint("maxAcceleration", a.get("maxAcceleration").asDouble());
+        return applyOrDryRun(before, after, a.hasNonNull("out") ? a.get("out").asText() : null);
+    }
+
+    private static final List<String> SWERVE_CANDIDATES = SignalResolver.SWERVE;
+    private static final List<String> VISION_CANDIDATES = SignalResolver.VISION;
+    private static final List<String> LOOP_CANDIDATES = SignalResolver.LOOP_PERIOD;
+    private static final List<String> CYCLE_CANDIDATES = SignalResolver.CYCLE_COUNTER;
+
+    private static String modeA(JsonNode a) throws Exception {
+        try (TrendStore store = new TrendStore(str(a, "db"))) {
+            ModeAPass.Outcome outcome = ModeAPass.run(store, str(a, "file"));
+            ModeA.Result res = outcome.result();
+            return res.report()
+                    + "Overall: " + res.worst() + " (log #" + outcome.logId() + ", metrics persisted)";
+        }
+    }
+
+    /**
+     * One-shot catch-up scan. The watcher daemon itself is deliberately not an MCP tool — a tool
+     * call has to return, so a blocking daemon would either hang the agent or return immediately
+     * having done nothing. This is the request/response-shaped half of it: sweep the directories
+     * once, analyze whatever is new, and report.
+     */
+    private static String modeAScan(JsonNode a) throws Exception {
+        List<Path> roots = new java.util.ArrayList<>();
+        JsonNode dirs = a.get("dirs");
+        if (dirs != null && dirs.isArray()) {
+            dirs.forEach(d -> roots.add(Path.of(d.asText())));
+        } else if (dirs != null && dirs.isTextual()) {
+            roots.add(Path.of(dirs.asText()));
+        }
+        if (roots.isEmpty()) {
+            return "Pass 'dirs' with at least one directory to scan.";
+        }
+        try (TrendStore store = new TrendStore(str(a, "db"))) {
+            List<LogWatcher.Event> events =
+                    new LogWatcher(store, roots, 1, e -> {}).poll();
+            if (events.isEmpty()) {
+                return "Scanned " + roots + " — no new .wpilog files. Everything present was already"
+                        + " ingested (dedupe is by path, from the trend store).";
+            }
+            StringBuilder sb = new StringBuilder("Analyzed " + events.size() + " new log(s):\n\n");
+            for (LogWatcher.Event e : events) {
+                sb.append(LogWatcher.describe(e)).append('\n');
+                if (e instanceof LogWatcher.Event.Analyzed an) {
+                    sb.append(an.outcome().result().report()).append('\n');
+                }
+            }
+            sb.append("For continuous between-match ingest, run the daemon instead:"
+                    + " `modes watch <db> <dir>...`.");
+            return sb.toString();
+        }
+    }
+
+    private static String swerve(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        String signal = a.hasNonNull("entry") ? a.get("entry").asText()
+                : SignalResolver.resolve(r.index(), SWERVE_CANDIDATES).orElse(null);
+        if (signal == null) {
+            return "No swerve module signal found; pass 'entry' with a velocity/voltage signal name.";
+        }
+        return "signal: " + signal + "\n" + SwerveAnalysis.analyze(Series.fromSamples(r.read(signal))).assessment();
+    }
+
+    private static String vision(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Optional<String> sig = SignalResolver.resolve(r.index(), VISION_CANDIDATES);
+        if (sig.isEmpty()) {
+            return "No vision detection signal found.";
+        }
+        return "signal: " + sig.get() + "\n" + VisionAnalysis.analyze(Series.fromSamples(r.read(sig.get())), null).assessment();
+    }
+
+    private static String loopTiming(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Optional<String> sig = SignalResolver.resolve(r.index(), LOOP_CANDIDATES);
+        if (sig.isEmpty()) {
+            return "No loop-timing signal found.";
+        }
+        return "signal: " + sig.get() + "\n" + LoopTiming.analyze(Series.fromSamples(r.read(sig.get()))).assessment();
+    }
+
+    private static String batteryHealth(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Optional<String> volt = SignalResolver.resolve(r.index(), SignalResolver.VOLTAGE);
+        if (volt.isEmpty()) {
+            return "No battery-voltage signal found.";
+        }
+        Series current = seriesFor(r, r.index(), SignalResolver.TOTAL_CURRENT);
+        return "signal: " + volt.get() + "\n"
+                + BatteryHealth.analyze(Series.fromSamples(r.read(volt.get())), current.isEmpty() ? null : current).assessment();
+    }
+
+    private static String anomaly(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Series s = Series.fromSamples(r.read(str(a, "entry")));
+        return AnomalyDetection.detect(s).assessment();
+    }
+
+    private static String analyzeCycles(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        String signal = a.hasNonNull("entry") ? a.get("entry").asText()
+                : SignalResolver.resolve(r.index(), CYCLE_CANDIDATES).orElse(null);
+        if (signal == null) {
+            return "No cycle/score counter signal found; pass 'entry' with a monotonic counter name.";
+        }
+        CycleTime.Result res = CycleTime.analyze(Series.fromSamples(r.read(signal)));
+        return "signal: " + signal + "\n" + res.assessment();
+    }
+
+    private static String signalStats(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Series s = Series.fromSamples(r.read(str(a, "entry")));
+        if (s.isEmpty()) {
+            return "(no numeric samples for '" + str(a, "entry") + "')";
+        }
+        Statistics.Result st = Statistics.of(s);
+        return String.format(
+                "signal: %s%nmin=%.4f max=%.4f mean=%.4f median=%.4f stdDev=%.4f p95=%.4f%n%s",
+                str(a, "entry"), st.min(), st.max(), st.mean(), st.median(), st.stdDev(), st.p95(),
+                st.quality().caveat());
+    }
+
+    private static String compareSignals(JsonNode a) throws Exception {
+        Series first = seriesOf(str(a, "file"), str(a, "entry"));
+        String fileB = a.hasNonNull("fileB") ? a.get("fileB").asText() : str(a, "file");
+        String entryB = a.hasNonNull("entryB") ? a.get("entryB").asText() : str(a, "entry");
+        Series second = seriesOf(fileB, entryB);
+        if (first.isEmpty() || second.isEmpty()) {
+            return "One or both signals have no numeric samples; cannot compare.";
+        }
+        return "a: " + str(a, "entry") + "\nb: " + entryB + "\n" + Compare.of(first, second).assessment();
+    }
+
+    private static String correlate(JsonNode a) throws Exception {
+        Series first = seriesOf(str(a, "file"), str(a, "entry"));
+        String fileB = a.hasNonNull("fileB") ? a.get("fileB").asText() : str(a, "file");
+        Series second = seriesOf(fileB, str(a, "entryB"));
+        if (first.isEmpty() || second.isEmpty()) {
+            return "One or both signals have no numeric samples; cannot correlate.";
+        }
+        return "a: " + str(a, "entry") + "\nb: " + str(a, "entryB") + "\n"
+                + Correlation.of(first, second).assessment();
+    }
+
+    private static String findPeaks(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Series s = Series.fromSamples(r.read(str(a, "entry")));
+        double minProminence = a.hasNonNull("minProminence") ? a.get("minProminence").asDouble() : 1.0;
+        PeakFinder.Result res = PeakFinder.find(s, minProminence);
+        StringBuilder sb = new StringBuilder("signal: " + str(a, "entry") + "\n" + res.assessment() + "\n");
+        for (PeakFinder.Peak p : res.peaks()) {
+            sb.append(String.format("  - %.3fs  %.4f%n", p.timeSeconds(), p.value()));
+        }
+        return sb.toString();
+    }
+
+    private static String rateOfChange(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Series s = Series.fromSamples(r.read(str(a, "entry")));
+        if (s.size() < 2) {
+            return "Fewer than two numeric samples for '" + str(a, "entry") + "'; no slope to report.";
+        }
+        RateOfChange.Result res = RateOfChange.of(s);
+        return String.format(
+                "signal: %s%nmaxSlope=%.4f/s (at %.3fs) minSlope=%.4f/s meanAbsSlope=%.4f/s%n%s",
+                str(a, "entry"), res.maxSlope(), res.maxSlopeTimeSeconds(), res.minSlope(),
+                res.meanAbsSlope(), res.quality().caveat());
+    }
+
+    private static String dataQuality(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "file"));
+        Series s = Series.fromSamples(r.read(str(a, "entry")));
+        DataQuality q = DataQuality.of(s.timestampsUs());
+        return String.format(
+                "signal: %s%nsamples=%d span=%.2fs medianPeriod=%.2fms maxGap=%.2fms confidence=%s%n%s",
+                str(a, "entry"), q.sampleCount(), q.spanSeconds(), q.medianPeriodMs(), q.maxGapMs(),
+                q.confidence(), q.caveat());
+    }
+
+    private static Series seriesOf(String file, String entry) throws Exception {
+        return Series.fromSamples(new WpilogReader(file).read(entry));
+    }
+
+    /** Where the knowledge index lives unless a call overrides it. */
+    private static final String DEFAULT_KNOWLEDGE_DB = ".knowledge/frc.kdb";
+
+    private static String knowledgeDb(JsonNode a) {
+        return a.hasNonNull("db") ? a.get("db").asText() : DEFAULT_KNOWLEDGE_DB;
+    }
+
+    private static String searchDocs(JsonNode a) throws Exception {
+        String source = a.hasNonNull("source") ? a.get("source").asText() : null;
+        return knowledgeSearch(knowledgeDb(a), str(a, "query"), source, limitOf(a));
+    }
+
+    private static String searchManual(JsonNode a) throws Exception {
+        return knowledgeSearch(knowledgeDb(a), str(a, "query"), "manual", limitOf(a));
+    }
+
+    private static int limitOf(JsonNode a) {
+        return a.hasNonNull("limit") ? Math.max(1, Math.min(20, a.get("limit").asInt())) : 6;
+    }
+
+    private static String knowledgeSearch(String db, String query, String source, int limit) throws Exception {
+        if (!java.nio.file.Files.exists(Path.of(db))) {
+            return "No knowledge index at " + db + ".\n"
+                    + "Build one with:  knowledge sync " + db + " .knowledge\n"
+                    + "For the game manual:  knowledge manual " + db + " <manual.pdf>";
+        }
+        try (KnowledgeIndex index = new KnowledgeIndex(db)) {
+            List<SearchHit> hits = index.search(query, source, limit);
+            if (hits.isEmpty()) {
+                String scope = source == null ? "the indexed docs" : "the '" + source + "' corpus";
+                return "No matches in " + scope + " for: " + query
+                        + "\nCall knowledge_status to see what is actually indexed.";
+            }
+            StringBuilder sb = new StringBuilder();
+            for (SearchHit h : hits) {
+                sb.append(h.render()).append("\n\n");
+            }
+            sb.append("(Lexical search over the indexed docs — these are the passages that matched, ")
+                    .append("not a verified answer. Read the passage before relying on it.)");
+            return sb.toString();
+        }
+    }
+
+    private static String knowledgeStatus(JsonNode a) throws Exception {
+        String db = knowledgeDb(a);
+        if (!java.nio.file.Files.exists(Path.of(db))) {
+            return "No knowledge index at " + db + ". Build one with: knowledge sync " + db + " .knowledge";
+        }
+        try (KnowledgeIndex index = new KnowledgeIndex(db)) {
+            Map<String, Integer> sources = index.sources();
+            if (sources.isEmpty()) {
+                return "Index exists at " + db + " but nothing is indexed yet.";
+            }
+            StringBuilder sb = new StringBuilder("Indexed corpora in " + db + ":\n");
+            sources.forEach((name, count) -> sb.append(String.format("  %-14s %d chunks%n", name, count)));
+            if (!sources.containsKey("manual")) {
+                sb.append("  (no game manual indexed — run: knowledge manual ").append(db).append(" <manual.pdf>)\n");
+            }
+            return sb.toString();
+        }
+    }
+
+    /**
+     * How long the one-shot NT tools wait for the robot's first announcement/value after the
+     * connection is established. NT4 sends these asynchronously, so reading immediately makes a
+     * healthy robot look silent.
+     */
+    private static final double NT_VALUE_TIMEOUT_SECONDS = 3.0;
+
+    private static int ntPort(JsonNode a) {
+        return a.hasNonNull("port") ? a.get("port").asInt() : NetworkTableInstance.kDefaultPort4;
+    }
+
+    private static String ntStatus(JsonNode a) {
+        try (NtClient client = new NtClient()) {
+            client.connect("frc-ai-copilot", str(a, "host"), ntPort(a));
+            boolean up = client.waitForConnection(3.0);
+            return up ? "Connected to " + str(a, "host") + " (" + client.connections().size() + " connection(s))."
+                    : "Not connected to " + str(a, "host") + " within 3s (robot off / wrong host?).";
+        }
+    }
+
+    private static String ntGet(JsonNode a) {
+        try (NtClient client = new NtClient()) {
+            client.connect("frc-ai-copilot", str(a, "host"), ntPort(a));
+            if (!client.waitForConnection(3.0)) {
+                return "Not connected to " + str(a, "host") + " within 3s.";
+            }
+            String key = str(a, "key");
+            // Not getValue: NT4 delivers the first value a moment after the connection is up, so an
+            // immediate read reports "not published" for a key the robot is actively publishing.
+            var value = client.getValueWithin(key, NT_VALUE_TIMEOUT_SECONDS);
+            return value.isValid() ? key + " = " + value.getValue() : key + " (no value / not published).";
+        }
+    }
+
+    private static String ntKeys(JsonNode a) {
+        try (NtClient client = new NtClient()) {
+            client.connect("frc-ai-copilot", str(a, "host"), ntPort(a));
+            if (!client.waitForConnection(3.0)) {
+                return "Not connected to " + str(a, "host") + " within 3s.";
+            }
+            String prefix = a.hasNonNull("prefix") ? a.get("prefix").asText() : "";
+            // Topics are announced asynchronously after connect, so wait for the first one rather
+            // than reporting an empty table for a robot that is publishing normally.
+            var keys = client.keysWithin(prefix, NT_VALUE_TIMEOUT_SECONDS);
+            if (keys.isEmpty()) {
+                return "(no keys" + (prefix.isEmpty() ? "" : " under " + prefix) + " published)";
+            }
+            return String.join("\n", keys);
+        }
+    }
+
+    private static String autoShow(JsonNode a) throws Exception {
+        AutoFile auto = AutoFile.load(Path.of(str(a, "auto")));
+        return "paths referenced: " + auto.listPathReferences();
+    }
+
+    private static String autoSwap(JsonNode a) throws Exception {
+        AutoFile before = AutoFile.load(Path.of(str(a, "auto")));
+        AutoFile after = before.copy();
+        int n = after.replacePathReference(str(a, "oldName"), str(a, "newName"));
+        if (n == 0) {
+            return "No references to '" + str(a, "oldName") + "' found; no change.";
+        }
+        List<PathDiff.Change> changes = PathDiff.diff(before.root(), after.root());
+        StringBuilder sb = new StringBuilder("Proposed (" + n + " reference(s) renamed):\n");
+        changes.forEach(c -> sb.append("  ").append(c).append('\n'));
+        if (a.hasNonNull("out")) {
+            after.save(Path.of(a.get("out").asText()));
+            sb.append("Wrote to: ").append(a.get("out").asText());
+        } else {
+            sb.append("Dry run — pass 'out' to write a copy (original never overwritten).");
+        }
+        return sb.toString();
+    }
+
+    private static Series seriesFor(WpilogReader r, Map<Integer, LogEntry> index, List<String> candidates) {
+        return SignalResolver.resolve(index, candidates)
+                .map(s -> Series.fromSamples(r.read(s)))
+                .orElse(new Series(new double[0], new long[0]));
+    }
+
+    private static String loopCheck(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "log"));
+        Scenario scenario = Scenario.load(Path.of(str(a, "scenario")));
+        return Verifier.verify(scenario, r::read).render();
+    }
+
+    private static String loopSuite(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "log"));
+        List<Scenario> scenarios = RegressionSuite.load(Path.of(str(a, "scenarioDir")));
+        if (scenarios.isEmpty()) {
+            return "No scenarios found in " + str(a, "scenarioDir");
+        }
+        return RegressionSuite.runAll(scenarios, r::read).render();
+    }
+
+    private static String loopBootstrap(JsonNode a) throws Exception {
+        LoopConfig config = LoopConfig.load(LoopConfig.discover(Path.of(optional(a, "config", ""))));
+        String inputLog = optional(a, "inputLog", null);
+        return LoopRunner.bootstrap(config, inputLog == null ? null : Path.of(inputLog)).render();
+    }
+
+    private static String loopBaseline(JsonNode a) throws Exception {
+        LoopConfig config = LoopConfig.load(LoopConfig.discover(Path.of(optional(a, "config", ""))));
+        LoopSession session = LoopSession.load(config.sessionFile());
+        LoopSession.Iteration passing = null;
+        for (LoopSession.Iteration it : session.iterations) {
+            if (it.passed && it.log != null) {
+                passing = it;
+            }
+        }
+        if (passing == null) {
+            return "No passing iteration with a log yet — call loop_iterate until it passes, then"
+                    + " adopt that run as the baseline.";
+        }
+        Path target = config.baselinePath();
+        if (target == null) {
+            return "This project's loop.yaml has no 'baseline:' path, so there is nowhere to put it."
+                    + " Add e.g. `baseline: .loop/baseline.wpilog` and call this again.";
+        }
+        java.nio.file.Files.createDirectories(target.getParent());
+        java.nio.file.Files.copy(
+                Path.of(passing.log), target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        return "Baseline adopted from iteration #" + passing.number + ": " + target
+                + "\nFuture turns now report which signals diverged from this run, and can tell a"
+                + " sign error from a shortfall.";
+    }
+
+    private static String loopIterate(JsonNode a) throws Exception {
+        LoopConfig config = LoopConfig.load(LoopConfig.discover(Path.of(optional(a, "config", ""))));
+        String scenario = optional(a, "scenario", null);
+        String inputLog = optional(a, "inputLog", null);
+        LoopRunner.IterationReport report = LoopRunner.iterate(
+                config,
+                scenario == null ? null : Path.of(scenario),
+                inputLog == null ? null : Path.of(inputLog));
+        return report.render();
+    }
+
+    private static String smallmodelTrain(JsonNode a) throws Exception {
+        List<String> signals = strings(a, "signals");
+        List<Long> positives = timestampsUs(a, "positives");
+        List<Long> negatives = timestampsUs(a, "negatives");
+        if (signals.isEmpty()) {
+            return "Pass 'signals': the log signals to use as features (log_entries lists them).";
+        }
+        if (positives.isEmpty()) {
+            return "Pass 'positives': the timestamps (seconds) you are marking as the positive class."
+                    + " A handful is enough — that is the point of the technique.";
+        }
+        int stride = a.hasNonNull("stride") ? a.get("stride").asInt() : 10;
+        double threshold = a.hasNonNull("threshold") ? a.get("threshold").asDouble() : 0.5;
+        int epochs = a.hasNonNull("epochs") ? a.get("epochs").asInt() : 3000;
+        double lr = a.hasNonNull("learningRate") ? a.get("learningRate").asDouble() : 0.1;
+
+        String logPath = str(a, "log");
+        WpilogReader reader = new WpilogReader(logPath);
+        Dataset dataset = LogFeatures.build(reader, signals, positives, negatives, stride);
+        LogisticModel model = LogisticModel.train(dataset, epochs, lr);
+        LogisticModel.Eval eval = model.evaluate(dataset.x(), dataset.y(), threshold);
+
+        Path out = Path.of(str(a, "out"));
+        SavedModel saved = SavedModel.of(
+                out.getFileName().toString().replaceFirst("\\.json$", ""),
+                "Trained from " + logPath, dataset, model, threshold, eval);
+        saved.save(out);
+
+        return saved.renderSummary()
+                + "saved: " + out + "\n"
+                + "NOTE: those metrics are on the TRAINING set. They show the model fit your marks,"
+                + " not that it generalizes. Validate with smallmodel_score against a different log"
+                + " (or in replay) before trusting it on the robot.";
+    }
+
+    private static String smallmodelScore(JsonNode a) throws Exception {
+        SavedModel model = SavedModel.load(Path.of(str(a, "model")));
+        WpilogReader reader = new WpilogReader(str(a, "log"));
+        int top = a.hasNonNull("top") ? a.get("top").asInt() : 10;
+
+        List<java.util.TreeMap<Long, Double>> timelines =
+                LogFeatures.timelines(reader, model.features);
+        record Scored(long ts, double p) {}
+        List<Scored> all = new java.util.ArrayList<>();
+        int fired = 0;
+        for (long ts : timelines.get(0).navigableKeySet()) {
+            double p = model.probability(LogFeatures.featuresAt(timelines, ts));
+            all.add(new Scored(ts, p));
+            if (p >= model.threshold) {
+                fired++;
+            }
+        }
+        all.sort((x, y) -> Double.compare(y.p(), x.p()));
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("model %s over %s%n", model.name, str(a, "log")));
+        sb.append(String.format("fired at %d of %d sampled timestamps (threshold %.2f)%n",
+                fired, all.size(), model.threshold));
+        sb.append("highest-scoring moments:\n");
+        for (int i = 0; i < Math.min(top, all.size()); i++) {
+            sb.append(String.format("  %8.3f s  p=%.4f%n",
+                    all.get(i).ts() / 1_000_000.0, all.get(i).p()));
+        }
+        return sb.toString();
+    }
+
+    /** Read a JSON array of strings, tolerating a single string for convenience. */
+    private static List<String> strings(JsonNode a, String field) {
+        List<String> out = new java.util.ArrayList<>();
+        JsonNode n = a.get(field);
+        if (n == null || n.isNull()) {
+            return out;
+        }
+        if (n.isTextual()) {
+            out.add(n.asText());
+        } else if (n.isArray()) {
+            n.forEach(e -> out.add(e.asText()));
+        }
+        return out;
+    }
+
+    /** Read a JSON array of timestamps in seconds, converted to the log's microseconds. */
+    private static List<Long> timestampsUs(JsonNode a, String field) {
+        List<Long> out = new java.util.ArrayList<>();
+        JsonNode n = a.get(field);
+        if (n == null || n.isNull()) {
+            return out;
+        }
+        if (n.isNumber() || n.isTextual()) {
+            out.add((long) (n.asDouble() * 1_000_000));
+        } else if (n.isArray()) {
+            n.forEach(e -> out.add((long) (e.asDouble() * 1_000_000)));
+        }
+        return out;
+    }
+
+    private static String loopHistory(JsonNode a) throws Exception {
+        LoopConfig config = LoopConfig.load(LoopConfig.discover(Path.of(optional(a, "config", ""))));
+        return LoopSession.load(config.sessionFile()).render();
+    }
+
+    private static String loopGenerate(JsonNode a) throws Exception {
+        WpilogReader r = new WpilogReader(str(a, "log"));
+        String out = optional(a, "out", null);
+        String name = optional(a, "name", "generated_scenario");
+        Scenario scenario = ScenarioGenerator.generate(
+                r, name, optional(a, "phaseSignal", null), optional(a, "phaseEquals", null),
+                ScenarioGenerator.DEFAULT_TOLERANCE);
+        if (scenario.assertions().isEmpty()) {
+            return "No signal in " + str(a, "log") + " had a shape worth asserting (a counter,"
+                    + " battery voltage, loop period, or a converging error). Write the scenario"
+                    + " by hand instead.";
+        }
+        String yaml = scenario.toYaml();
+        if (out == null) {
+            return "Proposed scenario (dry run — pass 'out' to write it):\n" + yaml;
+        }
+        scenario.save(Path.of(out));
+        return "Wrote " + scenario.assertions().size() + " generated checks to " + out + "\n" + yaml;
+    }
+
+    private static String loopDiff(JsonNode a) throws Exception {
+        LogDiff.Result result = LogDiff.compare(
+                new WpilogReader(str(a, "baseline")), new WpilogReader(str(a, "log")));
+        return result.render(20);
+    }
+
+    private static String applyOrDryRun(PathFile before, PathFile after, String out) throws Exception {
+        List<PathDiff.Change> changes = PathDiff.diff(before.root(), after.root());
+        if (changes.isEmpty()) {
+            return "(no change)";
+        }
+        StringBuilder sb = new StringBuilder("Proposed changes:\n");
+        changes.forEach(c -> sb.append("  ").append(c).append('\n'));
+        if (out == null) {
+            sb.append("Dry run — pass 'out' to write a copy (the original is never overwritten).");
+        } else {
+            after.save(Path.of(out));
+            sb.append("Wrote edited path to: ").append(out);
+        }
+        return sb.toString();
+    }
+
+    private static String render(Object v) {
+        if (v instanceof byte[] b) return "<raw " + b.length + " bytes>";
+        if (v instanceof double[] d) return java.util.Arrays.toString(d);
+        if (v instanceof long[] l) return java.util.Arrays.toString(l);
+        if (v instanceof boolean[] b) return java.util.Arrays.toString(b);
+        if (v instanceof Object[] o) return java.util.Arrays.toString(o);
+        return String.valueOf(v);
+    }
+
+    /** Read an optional string argument, falling back when absent, null, or blank. */
+    private static String optional(JsonNode args, String key, String fallback) {
+        JsonNode v = args == null ? null : args.get(key);
+        if (v == null || v.isNull() || v.asText().isBlank()) {
+            return fallback;
+        }
+        return v.asText();
+    }
+
+    private static String str(JsonNode args, String key) {
+        JsonNode v = args.get(key);
+        if (v == null || v.isNull()) {
+            throw new IllegalArgumentException("missing required argument: " + key);
+        }
+        return v.asText();
+    }
+
+    private static void add(Map<String, Tool> tools, Tool t) {
+        tools.put(t.name(), t);
+    }
+
+    private ToolRegistry() {}
+}

@@ -1,0 +1,15 @@
+rootProject.name = 'frc-ai-copilot'
+
+// Modules are added as they come online (see plan build order).
+include 'core-ingest'
+include 'profile'
+include 'analysis'
+include 'write-layer'
+include 'mcp-server'
+include 'live-nt'
+include 'simreplay'
+include 'modes'
+include 'smallmodel'
+include 'example-robot'
+include 'dashboard'
+include 'knowledge'

@@ -1,0 +1,582 @@
+/*
+ * Design system carried over from the ScoutPanda dashboard: the same Linear-derived token set,
+ * so the two team tools look like one family. Components style themselves from these variables
+ * with inline styles rather than utility classes — no Tailwind here, since the token layer is
+ * doing the work.
+ *
+ * Light is the default — a pit is a bright room and the laptop is often on a cart in daylight —
+ * but both themes ship, switched by `data-theme` on the root element.
+ */
+
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/GeistVF.woff") format("woff-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMonoVF.woff") format("woff-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+:root {
+  /*
+   * Keeps browser-rendered UI (scrollbars, form controls) on the same side as the tokens. Without
+   * it, an OS in dark mode would render grey scrollbars against the light page.
+   */
+  color-scheme: light;
+
+  --theme-bg: #ffffff;
+  --theme-panel: #fafafb;
+  --theme-rail: #f6f7f8;
+  --theme-card: #fafafb;
+  --theme-border: rgba(0, 0, 0, 0.09);
+  --theme-border2: rgba(0, 0, 0, 0.12);
+  --theme-border3: rgba(0, 0, 0, 0.17);
+  --theme-border4: rgba(0, 0, 0, 0.06);
+  --theme-scrollbar: rgba(0, 0, 0, 0.22);
+  --theme-text: #16181a;
+  --theme-text2: #3f444b;
+  --theme-textMuted: #585d64;
+  --theme-textFaint: #6b7076;
+  --theme-textFaint2: #767b82;
+  --theme-textGhost: #c7cbd1;
+  --theme-hover: #f1f2f4;
+  --theme-selected: #eaebee;
+  --theme-track: #e6e8eb;
+  --theme-trackFill: #9aa0a8;
+  --theme-red: #dc2626;
+  --theme-redBg: rgba(220, 38, 38, 0.07);
+  --theme-blue: #2563eb;
+  --theme-blueBg: rgba(37, 99, 235, 0.07);
+  --theme-green: #15803d;
+  --theme-greenBg: rgba(21, 128, 61, 0.07);
+  --theme-amberBorder: rgba(180, 83, 9, 0.3);
+  --theme-amberBg: rgba(245, 158, 11, 0.13);
+  --theme-amberDot: #b45309;
+  --theme-amberText: #8a5a08;
+
+  --accent: #5e6ad2;
+
+  --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Transition tokens — everything uses one cadence so the UI moves as a unit. */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur: 160ms;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --theme-bg: #08090a;
+  --theme-panel: #0f1011;
+  --theme-rail: #0b0c0d;
+  --theme-card: #0f1011;
+  --theme-border: rgba(255, 255, 255, 0.07);
+  --theme-border2: rgba(255, 255, 255, 0.09);
+  --theme-border3: rgba(255, 255, 255, 0.14);
+  --theme-border4: rgba(255, 255, 255, 0.05);
+  --theme-scrollbar: rgba(255, 255, 255, 0.15);
+  --theme-text: #f7f8f8;
+  --theme-text2: #c9cbd1;
+  --theme-textMuted: #8a8f98;
+  --theme-textFaint: #62666d;
+  --theme-textFaint2: #4e5158;
+  --theme-textGhost: #3f4249;
+  --theme-hover: #16181d;
+  --theme-selected: #1e2026;
+  --theme-track: #1b1d22;
+  --theme-trackFill: #5b5e66;
+  --theme-red: #ef4444;
+  --theme-redBg: rgba(239, 68, 68, 0.08);
+  --theme-blue: #3b82f6;
+  --theme-blueBg: rgba(59, 130, 246, 0.08);
+  --theme-green: #4ade80;
+  --theme-greenBg: rgba(74, 222, 128, 0.07);
+  --theme-amberBorder: rgba(245, 158, 11, 0.22);
+  --theme-amberBg: rgba(245, 158, 11, 0.08);
+  --theme-amberDot: #f59e0b;
+  --theme-amberText: #d8c08a;
+
+  --accent: #7c5cff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/*
+ * Keyboard focus. The panes have no other affordance for where you are, so this is the only
+ * thing standing between a keyboard user and a blind tab through the whole nav.
+ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 5px;
+}
+
+body {
+  margin: 0;
+  background: var(--theme-bg);
+  color: var(--theme-text);
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--theme-scrollbar);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Micro-label: the uppercase mono caption used above every panel and stat. */
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--theme-textFaint);
+}
+
+/* Tabular figures keep live numbers from jittering as digits change. */
+.numeric {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+}
+
+.nav-item {
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.nav-item:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+
+/*
+ * ---- Shell layout ----
+ *
+ * Wide (≥ 900px): three fixed panes, each scrolling independently, so the nav and status stay put
+ * while telemetry scrolls. Narrow: the panes stack and the page scrolls as one — a pit laptop is
+ * the primary scene, but a phone on the cart is a real one, and three fixed columns crush the
+ * content to a single word per line well before that.
+ */
+.shell {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+.shell-main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--theme-bg);
+}
+
+.shell-sidebar {
+  flex-shrink: 0;
+  width: 212px;
+  border-right: 1px solid var(--theme-border);
+  background: var(--theme-rail);
+  display: flex;
+  flex-direction: column;
+}
+
+.shell-rail {
+  flex-shrink: 0;
+  width: 250px;
+  border-left: 1px solid var(--theme-border);
+  background: var(--theme-rail);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.sidebar-head {
+  border-bottom: 1px solid var(--theme-border);
+}
+
+.sidebar-nav {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 8px;
+}
+
+.sidebar-foot {
+  padding: 10px 12px 10px 16px;
+  border-top: 1px solid var(--theme-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/*
+ * Four health checks: 2x2 or 4x1, never 3+1. `auto-fit` orphans the fourth tile onto its own row
+ * at common widths, which reads as an unfinished layout rather than a deliberate one.
+ */
+.tile-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+@media (min-width: 560px) {
+  .tile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 820px) {
+  .chart-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1500px) {
+  .tile-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+/*
+ * ---- Responsive collapse ----
+ *
+ * Below 900px the three-column layout is unreadable. The sidebar becomes a horizontal top bar with
+ * scrollable nav, the status rail drops below the main content, and the whole page scrolls as one.
+ */
+@media (max-width: 899px) {
+  html,
+  body,
+  #root {
+    height: auto;
+    min-height: 100%;
+  }
+
+  .shell {
+    flex-direction: column;
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+
+  .shell-main {
+    overflow-y: visible;
+    order: 1;
+  }
+
+  .shell-sidebar {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--theme-border);
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    padding-right: 8px;
+    order: 0;
+  }
+
+  .sidebar-head {
+    border-bottom: none;
+    padding: 12px 4px 12px 16px;
+    flex-shrink: 0;
+  }
+
+  /* Nav becomes one horizontally scrollable row; group labels are dropped for space. */
+  .sidebar-nav {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .sidebar-group {
+    display: contents;
+  }
+
+  .sidebar-group-label {
+    display: none;
+  }
+
+  .sidebar-nav button {
+    width: auto !important;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .sidebar-foot {
+    border-top: none;
+    padding: 0;
+    flex-shrink: 0;
+  }
+
+  .sidebar-foot-label {
+    display: none;
+  }
+
+  /* Rail drops below the main content area. */
+  .shell-rail {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--theme-border);
+    overflow: visible;
+    order: 2;
+  }
+}
+
+/* At small widths the rail sections should reflow into a grid rather than stacking narrow. */
+@media (min-width: 500px) and (max-width: 899px) {
+  .shell-rail {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  }
+}
+
+.row-hover {
+  transition: background var(--dur) var(--ease);
+}
+.row-hover:hover {
+  background: var(--theme-hover);
+}
+
+/*
+ * ---- Card polish ----
+ *
+ * Subtle shadow and hover lift on cards. The pit dashboard is a tool, so the effects are kept
+ * restrained — just enough depth to separate cards from the background without being distracting.
+ */
+.card {
+  border: 1px solid var(--theme-border);
+  background: var(--theme-card);
+  border-radius: 8px;
+  transition: box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  border-color: var(--theme-border2);
+}
+[data-theme="dark"] .card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* Severity-tinted cards override the base card styles but keep the hover. */
+.card--watch {
+  border-color: var(--theme-amberBorder);
+  background: var(--theme-amberBg);
+}
+.card--watch:hover {
+  border-color: var(--theme-amberDot);
+}
+.card--critical {
+  border-color: var(--theme-red);
+  background: var(--theme-redBg);
+}
+.card--critical:hover {
+  border-color: var(--theme-red);
+}
+
+/* Pulse animation for critical severity dots. */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.dot-pulse {
+  animation: pulse-dot 2s var(--ease) infinite;
+}
+
+/* Smooth fade for chart tooltips. */
+.recharts-tooltip-wrapper {
+  transition: none !important;
+}
+
+/* Status rail section dividers — even spacing. */
+.rail-section {
+  padding: 18px 18px 16px;
+  border-bottom: 1px solid var(--theme-border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Coverage progress bar animated fill. */
+@keyframes fill-bar {
+  from { width: 0; }
+}
+.coverage-bar {
+  animation: fill-bar 600ms var(--ease) forwards;
+}
+
+/* ---- Phase 2 additions ---- */
+
+/* Responsive grid for StatCards — mirrors tile-grid breakpoints. */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+@media (min-width: 820px) {
+  .stat-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+/* Search input used in FilterBar. */
+.search-input {
+  width: 100%;
+  max-width: 320px;
+  padding: 6px 10px 6px 30px;
+  border: 1px solid var(--theme-border);
+  border-radius: 6px;
+  background: var(--theme-card);
+  color: var(--theme-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+}
+.search-input::placeholder {
+  color: var(--theme-textFaint);
+}
+.search-input:focus {
+  border-color: var(--accent);
+}
+
+/* Tab bar for metric/section switching (Trends page). */
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--theme-rail);
+  border: 1px solid var(--theme-border);
+  overflow-x: auto;
+}
+.tab-item {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--theme-textMuted);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tab-item:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+.tab-item[aria-selected="true"] {
+  background: var(--theme-card);
+  color: var(--theme-text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+[data-theme="dark"] .tab-item[aria-selected="true"] {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* Severity badge — inline pill. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Field canvas for path visualization. */
+.field-canvas {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16.54 / 8.21;
+  border: 1px solid var(--theme-border);
+  border-radius: 8px;
+  background: var(--theme-card);
+  overflow: hidden;
+}
+
+/* Expandable row animation. */
+.expand-row {
+  overflow: hidden;
+  transition: max-height 200ms var(--ease), opacity 200ms var(--ease);
+}
+.expand-row[data-open="false"] {
+  max-height: 0;
+  opacity: 0;
+}
+.expand-row[data-open="true"] {
+  max-height: 240px;
+  opacity: 1;
+}
+
+/* DataTable header sort indicator. */
+.sort-indicator {
+  display: inline-block;
+  font-size: 8px;
+  margin-left: 4px;
+  color: var(--theme-textFaint);
+}
+
+/* Profile device pills. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--theme-blueBg);
+  color: var(--theme-blue);
+  border: 1px solid transparent;
+}
+
+/* Trend bar chart bars. */
+.trend-bar {
+  transition: opacity var(--dur) var(--ease);
+}
+.trend-bar:hover {
+  opacity: 0.8;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

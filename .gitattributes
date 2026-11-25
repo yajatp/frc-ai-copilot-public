@@ -1,0 +1,29 @@
+# Line endings, pinned per file type.
+#
+# Git for Windows installs with core.autocrlf=true by default, which rewrites LF to CRLF on
+# checkout. For a POSIX shell script that is fatal rather than cosmetic: Git Bash reports
+# "bad interpreter: /bin/sh^M" and the wrapper never runs, which on a pit laptop looks like a
+# broken project rather than a line-ending setting. CI does not catch it because the hosted
+# Windows runners do not use that default.
+#
+# Deliberately not `* text=auto`: that would renormalize the whole tree in one commit and bury
+# real history. Only the files whose endings actually change behavior are pinned.
+
+# Shell scripts must stay LF on every platform, including Windows.
+gradlew      text eol=lf
+*.sh         text eol=lf
+
+# Batch files are the mirror image — cmd.exe needs CRLF.
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+
+# Binary, never touched.
+*.jar        binary
+*.wpilog     binary
+*.kdb        binary
+*.pdf        binary
+*.vsix       binary
+*.png        binary
+*.jpg        binary
+*.ico        binary
+graphify-out/graph.json merge=graphify

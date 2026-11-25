@@ -1,0 +1,79 @@
+// MCP server — wires the module tools over a JSON-RPC stdio transport (self-contained, no SDK).
+apply plugin: 'application'
+
+dependencies {
+    implementation project(':core-ingest')
+    implementation project(':profile')
+    implementation project(':analysis')
+    implementation project(':write-layer')
+    implementation project(':simreplay')
+    implementation project(':modes')
+    implementation project(':live-nt')
+    implementation project(':knowledge')
+    implementation project(':smallmodel')
+    implementation "edu.wpi.first.ntcore:ntcore-java:${wpilibVersion}" // NetworkTableValue/Instance on the nt_* tool API
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'org.mercsmavs.frccopilot.mcp.McpServer'
+}
+
+// --- ntcore desktop natives (ntcorejni + wpinetjni + wpiutiljni) ---
+configurations {
+    natives
+}
+
+dependencies {
+    natives "edu.wpi.first.ntcore:ntcore-cpp:${wpilibVersion}:${rootProject.wpiNativeClassifier}@zip"
+    natives "edu.wpi.first.wpinet:wpinet-cpp:${wpilibVersion}:${rootProject.wpiNativeClassifier}@zip"
+    natives "edu.wpi.first.wpiutil:wpiutil-cpp:${wpilibVersion}:${rootProject.wpiNativeClassifier}@zip"
+}
+
+def nativesDir = layout.buildDirectory.dir('natives')
+
+def extractNatives = tasks.register('extractNatives', Copy) {
+    from { configurations.natives.collect { zipTree(it) } }
+    include rootProject.wpiNativePattern
+    eachFile { it.path = it.name }
+    includeEmptyDirs = false
+    into nativesDir
+}
+
+tasks.withType(Test).configureEach {
+    dependsOn extractNatives
+    systemProperty 'java.library.path', nativesDir.get().asFile.absolutePath
+}
+
+tasks.named('run') {
+    dependsOn extractNatives
+    systemProperty 'java.library.path', nativesDir.get().asFile.absolutePath
+}
+
+// Bundle the natives into the installed distribution and rewrite the launcher's library path.
+distributions {
+    main {
+        contents {
+            from(nativesDir) { into 'natives' }
+        }
+    }
+}
+
+['installDist', 'distTar', 'distZip'].each { t -> tasks.named(t) { dependsOn extractNatives } }
+
+tasks.named('startScripts') {
+    dependsOn extractNatives
+    doLast {
+        // Inject the natives dir onto java.library.path in the exec line, where $APP_HOME expands
+        // (Gradle 8.x deliberately prevents shell expansion inside DEFAULT_JVM_OPTS).
+        unixScript.text = unixScript.text.replace(
+                'exec "$JAVACMD" "$@"',
+                'exec "$JAVACMD" "-Djava.library.path=$APP_HOME/natives" "$@"')
+        windowsScript.text = windowsScript.text.replace(
+                '"%JAVA_EXE%" %DEFAULT_JVM_OPTS%',
+                '"%JAVA_EXE%" "-Djava.library.path=%APP_HOME%\\natives" %DEFAULT_JVM_OPTS%')
+    }
+}
